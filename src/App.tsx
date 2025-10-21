@@ -8,10 +8,12 @@ import { Slider } from "@/components/ui/slider";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Label } from "@/components/ui/label";
 import { Download, Upload, Search, Database, Building2, Factory, Globe, ShieldCheck, Filter, CheckCircle2, AlertCircle } from "lucide-react";
-// -----------------------------
-// Seed Data (Sample & Editable)
-// -----------------------------
-// NOTE: These are illustrative examples to demo functionality. Replace/extend with real ingested data.
+
+/* =============================================================================
+   Seed Data (Sample & Editable)
+   NOTE: Replace/extend with real ingested data. The app can merge baked-in JSON
+   from /public/data/* and imported JSON files at runtime.
+============================================================================= */
 
 const SEED_SOURCES = [
   { id: "asme", name: "ASME Certificate Holders", region: "Global", categories: ["Boilers","Pressure Vessels","Piping"], trustLevel: 0.98, lastUpdated: "2025-09-30" },
@@ -134,10 +136,11 @@ const CATEGORY_BY_INDUSTRY: Record<string, string[]> = {
 
 const CERT_BADGES = ["ASME","NBBI","API","LR","DNV","SELO"] as const;
 
-// -----------------------------
-// Local Storage Helpers
-// -----------------------------
+/* =============================================================================
+   Local Storage Helpers (Safe Snapshot)
+============================================================================= */
 const LS_KEY = "avl_meta_search_data_v1";
+const MAX_PERSIST = 300;
 
 type Source = typeof SEED_SOURCES[number];
 type Vendor = typeof SEED_VENDORS[number];
@@ -152,22 +155,61 @@ function loadStore(): Store {
     const raw = localStorage.getItem(LS_KEY);
     if (!raw) return { sources: SEED_SOURCES, vendors: SEED_VENDORS };
     const parsed = JSON.parse(raw);
-    return { sources: parsed.sources || SEED_SOURCES, vendors: parsed.vendors || SEED_VENDORS };
-  } catch (e) {
+    return {
+      sources: Array.isArray(parsed.sources) ? parsed.sources : SEED_SOURCES,
+      vendors: Array.isArray(parsed.vendors) ? parsed.vendors.slice(0, MAX_PERSIST) : SEED_VENDORS,
+    };
+  } catch {
     return { sources: SEED_SOURCES, vendors: SEED_VENDORS };
   }
 }
 
-function saveStore(store: Store) {
-  localStorage.setItem(LS_KEY, JSON.stringify(store));
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+function saveStoreDebounced(store: Store) {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      const snapshot: Store = {
+        sources: store.sources,
+        vendors: store.vendors.slice(0, MAX_PERSIST),
+      };
+      localStorage.setItem(LS_KEY, JSON.stringify(snapshot));
+    } catch {
+      try { localStorage.setItem(LS_KEY, JSON.stringify({ sources: store.sources, vendors: [] })); } catch {}
+    }
+  }, 200);
 }
 
-// -----------------------------
-// Scoring Engine (Deterministic)
-// -----------------------------
-// Score combines: membership frequency weighted by source trust, certification strength,
-// category/industry match, region preference, and source recency.
+/* =============================================================================
+   Merge / Dedupe Helpers
+============================================================================= */
+function mergeSources(a: Source[], b: Source[]) {
+  const byId = new Map<string, Source>();
+  for (const s of [...a, ...b]) byId.set(s.id, s);
+  return Array.from(byId.values());
+}
 
+function dedupeByName(vendors: Vendor[]) {
+  const by = new Map<string, Vendor>();
+  for (const v of vendors) {
+    const key = v.name.toLowerCase();
+    if (!by.has(key)) {
+      by.set(key, { ...v });
+    } else {
+      const ex = by.get(key)!;
+      ex.avlMemberships = Array.from(new Set([...(ex.avlMemberships || []), ...(v.avlMemberships || [])])).sort();
+      ex.certifications = Array.from(new Set([...(ex.certifications || []), ...(v.certifications || [])])).sort();
+      if (v.country === "USA") ex.country = "USA";
+      // keep first industries/categories/products
+    }
+  }
+  return Array.from(by.values());
+}
+
+/* =============================================================================
+   Scoring Engine (Deterministic)
+   Score = membership*trust/recency + certs + industry/category match + region + product
+============================================================================= */
 function daysSince(dateStr: string) {
   const d = new Date(dateStr).getTime();
   const now = Date.now();
@@ -183,6 +225,7 @@ function scoreVendor(v: Vendor, opts: {
   minTrust: number;
 }) {
   const { sources, targetIndustry, targetCategory, productQuery, preferredRegions, minTrust } = opts;
+
   // Membership score (weighted by trust & recency)
   let membershipScore = 0;
   v.avlMemberships.forEach((sid) => {
@@ -215,9 +258,9 @@ function scoreVendor(v: Vendor, opts: {
   return Number(score.toFixed(4));
 }
 
-// -----------------------------
-// Utility Components
-// -----------------------------
+/* =============================================================================
+   Utility Components
+============================================================================= */
 function Pill({ children }: { children: React.ReactNode }) {
   return <span className="px-2 py-1 rounded-full text-xs bg-gray-100">{children}</span>;
 }
@@ -243,9 +286,9 @@ function Banner({ type = "ok", message }: { type?: "ok" | "warn"; message: strin
   );
 }
 
-// -----------------------------
-// Main App
-// -----------------------------
+/* =============================================================================
+   Main App
+============================================================================= */
 export default function App() {
   const [store, setStore] = useState<Store>(loadStore());
   const [industry, setIndustry] = useState<string>("Boiler");
@@ -263,18 +306,38 @@ export default function App() {
   const resultsRef = useRef<HTMLDivElement | null>(null);
   const companyRef = useRef<HTMLDivElement | null>(null);
 
+  // Persist (safe snapshot)
   useEffect(() => {
-    saveStore(store);
+    saveStoreDebounced(store);
   }, [store]);
 
+  // Keep category in sync with industry
   useEffect(() => {
     const firstCat = CATEGORY_BY_INDUSTRY[industry]?.[0] || "";
     setCategory(firstCat);
   }, [industry]);
 
+  // Load baked-in dataset once (public/data/avl_us_boilers.json)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/data/avl_us_boilers.json", { cache: "force-cache" });
+        if (!res.ok) return;
+        const data: Store = await res.json();
+        if (cancelled) return;
+        setStore(prev => ({
+          sources: mergeSources(prev.sources, data.sources || []),
+          vendors: dedupeByName([...(prev.vendors || []), ...((data.vendors as Vendor[]) || [])]),
+        }));
+      } catch (e) {
+        console.warn("Failed to load embedded dataset", e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const ranked = useMemo(() => {
-    // Include searchTick so the list recomputes when the button is pressed,
-    // even if the inputs didn't change (useful for user feedback/scroll).
     void searchTick;
     const list = store.vendors.map((v) => ({
       v,
@@ -290,7 +353,7 @@ export default function App() {
     return list.sort((a, b) => b.score - a.score);
   }, [store, industry, category, product, regions, minTrust, searchTick]);
 
-  // Company lookup: only show after pressing Check (or if user typed and pressed Enter)
+  // Company lookup (after Check)
   const lookup = useMemo(() => {
     void checkTick;
     if (!companyQuery.trim()) return null;
@@ -300,7 +363,9 @@ export default function App() {
     return { exists: true, vendor: v, memberships } as const;
   }, [companyQuery, store, checkTick]);
 
-  // Import/Export
+  /* =========================
+     Import / Export / Reset
+  ========================== */
   const handleExport = () => {
     const blob = new Blob([JSON.stringify(store, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -319,9 +384,12 @@ export default function App() {
       try {
         const parsed = JSON.parse(String(reader.result));
         if (!parsed.sources || !parsed.vendors) throw new Error("Invalid schema");
-        setStore({ sources: parsed.sources, vendors: parsed.vendors });
-        setFlashMsg("Dataset imported successfully.");
-        setTimeout(() => setFlashMsg(""), 2000);
+        // MERGE + DEDUPE instead of replacing
+        const mergedSources = mergeSources(store.sources, parsed.sources);
+        const mergedVendors = dedupeByName([...(store.vendors || []), ...(parsed.vendors || [])]);
+        setStore({ sources: mergedSources, vendors: mergedVendors });
+        setFlashMsg(`Dataset imported successfully. Vendors: +${(parsed.vendors || []).length}`);
+        setTimeout(() => setFlashMsg(""), 2200);
       } catch (err) {
         alert("Invalid JSON file. Expected { sources: [], vendors: [] } schema.");
       }
@@ -329,11 +397,17 @@ export default function App() {
     reader.readAsText(file);
   };
 
+  const handleReset = () => {
+    localStorage.removeItem(LS_KEY);
+    setStore({ sources: SEED_SOURCES, vendors: SEED_VENDORS });
+    setFlashMsg("Reset to seed dataset.");
+    setTimeout(() => setFlashMsg(""), 1600);
+  };
+
   const handleSearch = () => {
     setSearchTick((t) => t + 1);
     setFlashMsg("Search updated. Showing ranked vendors.");
     setTimeout(() => setFlashMsg(""), 1800);
-    // Smooth scroll to results
     resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
@@ -351,6 +425,9 @@ export default function App() {
     if (e.key === "Enter") handleCheck();
   };
 
+  /* =========================
+     UI
+  ========================== */
   return (
     <div className="p-6 md:p-10 max-w-7xl mx-auto space-y-8">
       <header className="flex items-start md:items-center justify-between gap-4 flex-col md:flex-row">
@@ -364,6 +441,7 @@ export default function App() {
             <input type="file" accept="application/json" className="absolute inset-0 opacity-0 cursor-pointer" onChange={handleImport} />
             <Button variant="secondary"><Upload className="w-4 h-4 mr-2"/>Import</Button>
           </div>
+          <Button variant="outline" onClick={handleReset} title="Clear saved snapshot & return to seed data">Reset</Button>
         </div>
       </header>
 
@@ -538,7 +616,10 @@ export default function App() {
               </Section>
 
               <Section title="Manage Data" icon={<Database className="w-5 h-5"/>}>
-                <p className="text-sm text-gray-600">Use <strong>Export</strong> to download your current dataset. Use <strong>Import</strong> to load JSON in the schema: {"{"}sources: Source[], vendors: Vendor[]{"}"}. You can merge real AVLs from scrapers or manual curation.</p>
+                <p className="text-sm text-gray-600">
+                  Use <strong>Export</strong> to download your current dataset. Use <strong>Import</strong> to load JSON in the schema: {"{ "}
+                  sources: Source[], vendors: Vendor[] {" }"}. You can merge real AVLs from scrapers or manual curation.
+                </p>
               </Section>
             </CardContent>
           </Card>
